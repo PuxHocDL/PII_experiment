@@ -13,3 +13,4 @@ scikit-learn
 numpy
 pytorch-crf
 python-dotenv
+gliner2
