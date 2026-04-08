@@ -18,6 +18,7 @@ from data.data_manager import PIIDataManager
 from models.token_based import TokenBasedModule
 from models.span_based import SpanBasedModule
 from models.gliner_based import GlinerPurePyTorch
+from models.gliner2_based import Gliner2PurePyTorch
 from validate.evaluator import BoundaryTolerantEvaluator
 
 logger = setup_logger("MainPipeline")
@@ -242,6 +243,7 @@ def interactive_config():
         ("bert_crf", "Token-based BERT + CRF"),
         ("span",     "Span-based DeBERTa"),
         ("gliner",   "GLiNER"),
+        ("gliner2",  "GLiNER2"),
         ("all",      "All architectures"),
     ]
     print("\n  Available architectures:")
@@ -259,6 +261,7 @@ def interactive_config():
         "bert_crf": "google-bert/bert-base-multilingual-cased",
         "span":     "microsoft/deberta-v3-base",
         "gliner":   "urchade/gliner_multi_pii-v1",
+        "gliner2":  "fastino/gliner2-base-v1",
     }
     base_model = None
     if model_key != "all":
@@ -333,7 +336,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="GenPII Framework Multi-Domain & Multi-Model Training")
     
     parser.add_argument("--datasets", nargs='+', default=["PuxAI/PII_Merged_Mapped_Dataset_Augmented"], help="List of HuggingFace dataset repositories to process.")
-    parser.add_argument("--models", nargs='+', choices=["bert", "bert_crf", "span", "gliner", "all"], default=["bert"], help="Select the model architectures to process.")
+    parser.add_argument("--models", nargs='+', choices=["bert", "bert_crf", "span", "gliner", "gliner2", "all"], default=["bert"], help="Select the model architectures to process.")
     parser.add_argument("--quick_test", action="store_true", help="Enable Dry-run mode.")
     parser.add_argument("--augment", action="store_true", help="Enable Targeted Data Augmentation (TA).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
@@ -382,7 +385,7 @@ def main():
 
     models_to_process = args.models
     if "all" in models_to_process:
-        models_to_process = ["bert", "bert_crf", "span", "gliner"]
+        models_to_process = ["bert", "bert_crf", "span", "gliner", "gliner2"]
 
     # --- SMART PATH RESOLVER IN ACTION ---
     resolved_model_path = None
@@ -442,6 +445,12 @@ def main():
                 m4 = GlinerPurePyTorch(resolved_model_path, unique_labels, safe_name)
                 evaluate_model(m4, test_data, evaluator, safe_name, f"GLiNER ({unique_tag})", api)
                 clean_memory(m4)
+
+            if "gliner2" in models_to_process:
+                logger.info(f"--- Loading Pre-trained GLiNER2 from {resolved_model_path} ---")
+                m5 = Gliner2PurePyTorch(resolved_model_path, unique_labels, safe_name)
+                evaluate_model(m5, test_data, evaluator, safe_name, f"GLiNER2 ({unique_tag})", api)
+                clean_memory(m5)
                 
             logger.info(f"EVALUATION COMPLETED FOR {safe_name}\n")
             continue
@@ -481,6 +490,14 @@ def main():
             m4.train(train_data, api)
             evaluate_model(m4, test_data, evaluator, safe_name, "GLiNER", api)
             clean_memory(m4)
+
+        if "gliner2" in models_to_process:
+            base = getattr(args, 'base_model', None) or "fastino/gliner2-base-v1"
+            logger.info(f"--- Training Model: GLiNER2 ({base}) on {safe_name} ---")
+            m5 = Gliner2PurePyTorch(base, unique_labels, safe_name)
+            m5.train(train_data, api)
+            evaluate_model(m5, test_data, evaluator, safe_name, "GLiNER2", api)
+            clean_memory(m5)
 
         logger.info(f"ALL REQUESTED MODELS COMPLETED, EVALUATED, AND PUSHED FOR {safe_name}\n")
 
