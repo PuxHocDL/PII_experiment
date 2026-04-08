@@ -1,0 +1,15 @@
+transformers
+datasets
+pandas
+evaluate
+seqeval
+torch
+gliner
+torchvision
+torchaudio
+accelerate
+huggingface_hub
+scikit-learn
+numpy
+pytorch-crf
+python-dotenv
