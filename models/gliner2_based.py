@@ -1,7 +1,12 @@
+import gc
 import os
 import json
+import re
 import shutil
 from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional
+
 import torch
 from gliner2 import GLiNER2
 from gliner2.training.data import InputExample
@@ -13,6 +18,23 @@ from config import RUN_QUICK_TEST, DEBUG_MODE, TARGET_REPO
 logger = setup_logger("GLiNER2Model")
 
 
+def _find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    """Return path to the best or latest checkpoint inside output_dir, or None."""
+    p = Path(output_dir)
+    if not p.exists():
+        return None
+    best = p / "best"
+    if best.exists() and (best / "config.json").exists():
+        return str(best)
+    epoch_dirs = sorted(
+        (d for d in p.iterdir() if re.match(r"checkpoint-epoch-\d+", d.name)),
+        key=lambda d: int(re.search(r"\d+", d.name).group()),
+    )
+    if epoch_dirs:
+        return str(epoch_dirs[-1])
+    return None
+
+
 class Gliner2PurePyTorch:
     def __init__(self, model_name_or_path, unique_labels, dataset_name):
         self.dataset_name = dataset_name
@@ -20,17 +42,21 @@ class Gliner2PurePyTorch:
 
         logger.info(f"Initializing GLiNER2 model from: {self.model_name}")
         self.model = GLiNER2.from_pretrained(self.model_name)
-        self.label_map = {lbl: lbl.lower().replace('/', '_').replace('-', '_') for lbl in unique_labels}
+        self.label_map = {lbl: lbl.lower().replace("/", "_").replace("-", "_") for lbl in unique_labels}
+        self.inverse_label_map = {v: k for k, v in self.label_map.items()}
 
     def prepare_dataset(self, records):
         examples = []
         for rec in records:
-            text = rec['source_text']
+            text = rec["source_text"]
             entities = {}
 
-            for m in rec.get('privacy_mask', []):
-                snake = self.label_map.get(m['label'].upper(), m['label'].lower().replace('/', '_'))
-                entity_text = text[m['start']:m['end']]
+            for m in rec.get("privacy_mask", []):
+                snake = self.label_map.get(
+                    m["label"].upper(),
+                    m["label"].lower().replace("/", "_").replace("-", "_"),
+                )
+                entity_text = text[m["start"]:m["end"]]
                 if entity_text:
                     entities.setdefault(snake, [])
                     if entity_text not in entities[snake]:
@@ -44,14 +70,20 @@ class Gliner2PurePyTorch:
     def train(self, train_data, api):
         logger.info("STARTING GLINER2 TRAINING LOOP")
         train_examples = self.prepare_dataset(train_data)
+        train_examples = [ex for ex in train_examples if getattr(ex, "text", "").strip()]
         logger.info(f"Prepared {len(train_examples)} training examples")
 
-        model_short = self.model_name.split('/')[-1]
+        model_short = self.model_name.split("/")[-1]
         run_name = f"gliner2-{model_short}"
         out_dir = f"./outputs/{self.dataset_name}/{run_name}"
         os.makedirs(out_dir, exist_ok=True)
 
-        config = TrainingConfig(
+        ckpt = _find_latest_checkpoint(out_dir)
+        if ckpt:
+            logger.info(f"Resuming from checkpoint: {ckpt}")
+            self.model = GLiNER2.from_pretrained(ckpt)
+
+        train_config = TrainingConfig(
             output_dir=out_dir,
             num_epochs=1 if RUN_QUICK_TEST else 3,
             batch_size=8,
@@ -59,10 +91,9 @@ class Gliner2PurePyTorch:
             task_lr=5e-4,
         )
 
-        trainer = GLiNER2Trainer(self.model, config)
+        trainer = GLiNER2Trainer(self.model, train_config)
         trainer.train(train_data=train_examples)
 
-        # Save training metadata
         training_meta = {
             "architecture": "gliner2",
             "base_model": self.model_name,
@@ -78,29 +109,36 @@ class Gliner2PurePyTorch:
                 folder_path=out_dir,
                 repo_id=TARGET_REPO,
                 path_in_repo=f"{self.dataset_name}/{run_name}",
-                repo_type="model"
+                repo_type="model",
             )
             shutil.rmtree(out_dir, ignore_errors=True)
             logger.info(f"Push {run_name} completed, local cleaned up.")
         else:
-            logger.info(f"DEBUG: Weights kept locally at {out_dir}")
+            logger.info(f"Weights kept locally at {out_dir}")
 
-    def predict(self, text: str):
-        # Create an inverse map to convert snake_case labels back to original format
-        inverse_label_map = {v: k for k, v in self.label_map.items()}
+    def predict(self, text: str) -> List[Dict]:
         target_labels = list(self.label_map.values())
 
-        result = self.model.extract_entities(text, target_labels, include_spans=True)
+        self.model.eval()
+        with torch.no_grad():
+            result = self.model.extract_entities(text, target_labels, include_spans=True)
 
         entities = []
-        for snake_label, spans in result.get('entities', {}).items():
-            original_tag = inverse_label_map.get(snake_label, snake_label.upper())
-            for span in spans:
-                entities.append({
-                    "start": span["start"],
-                    "end": span["end"],
-                    "tag": original_tag,
-                    "value": span["text"]
-                })
+        for snake_label, spans in result.get("entities", {}).items():
+            original_tag = self.inverse_label_map.get(snake_label, snake_label.upper())
+            for span in (spans if isinstance(spans, list) else []):
+                if isinstance(span, dict):
+                    entities.append({
+                        "start": span["start"],
+                        "end": span["end"],
+                        "tag": original_tag,
+                        "value": span.get("text", text[span["start"]:span["end"]]),
+                    })
 
         return entities
+
+    def cleanup(self):
+        del self.model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
